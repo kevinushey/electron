@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VerteDinde <vertedinde@electronjs.org>
+Date: Wed, 2 Mar 2022 14:55:26 -0800
+Subject: Revert "allow dump_syms to operate on contents in memory"
+
+This reverts commit 772cfc1db6374b793a4a717466d3efc4effee12b.
+
+diff --git a/src/client/mac/handler/minidump_generator.cc b/src/client/mac/handler/minidump_generator.cc
+index 05d91b08e9b7f5c94bf0ab2e5bed891bec97f096..95c205cb9015ed872cf7a3e51c7e5530d2f9e25a 100644
+--- a/src/client/mac/handler/minidump_generator.cc
++++ b/src/client/mac/handler/minidump_generator.cc
+@@ -1451,7 +1451,7 @@ bool MinidumpGenerator::WriteCVRecord(MDRawModule* module, int cpu_type,
+   unsigned char identifier[16];
+   bool result = false;
+   if (in_memory) {
+-    MacFileUtilities::MachoID macho(
++    MacFileUtilities::MachoID macho(module_path,
+         reinterpret_cast<void*>(module->base_of_image),
+         static_cast<size_t>(module->size_of_image));
+     result = macho.UUIDCommand(cpu_type, CPU_SUBTYPE_MULTIPLE, identifier);
+diff --git a/src/common/mac/dump_syms.cc b/src/common/mac/dump_syms.cc
+index b1cb1a300dc3f45ea8bbaabddb3776eeec383c9e..2718e2d6f2636f971c5f53912bf6d1978571f662 100644
+--- a/src/common/mac/dump_syms.cc
++++ b/src/common/mac/dump_syms.cc
+@@ -128,11 +128,10 @@ bool DumpSymbols::Read(const string& filename) {
+     return false;
+   }
+ 
+-  from_disk_ = true;
++  input_pathname_ = filename;
+ 
+   // Does this filename refer to a dSYM bundle?
+-  string contents_path = filename + "/Contents/Resources/DWARF";
+-  string object_filename;
++  string contents_path = input_pathname_ + "/Contents/Resources/DWARF";
+   if (S_ISDIR(st.st_mode) &&
+       access(contents_path.c_str(), F_OK) == 0) {
+     // If there's one file under Contents/Resources/DWARF then use that,
+@@ -140,31 +139,30 @@ bool DumpSymbols::Read(const string& filename) {
+     const vector<string> entries = list_directory(contents_path);
+     if (entries.size() == 0) {
+       fprintf(stderr, "Unable to find DWARF-bearing file in bundle: %s\n",
+-              filename.c_str());
++              input_pathname_.c_str());
+       return false;
+     }
+     if (entries.size() > 1) {
+       fprintf(stderr, "Too many DWARF files in bundle: %s\n",
+-              filename.c_str());
++              input_pathname_.c_str());
+       return false;
+     }
+ 
+-    object_filename = entries[0];
++    object_filename_ = entries[0];
+   } else {
+-    object_filename = filename;
++    object_filename_ = input_pathname_;
+   }
+ 
+   // Read the file's contents into memory.
+   bool read_ok = true;
+   string error;
+-  scoped_array<uint8_t> contents;
+-  off_t total = 0;
+-  if (stat(object_filename.c_str(), &st) != -1) {
+-    FILE* f = fopen(object_filename.c_str(), "rb");
++  if (stat(object_filename_.c_str(), &st) != -1) {
++    FILE* f = fopen(object_filename_.c_str(), "rb");
+     if (f) {
+-      contents.reset(new uint8_t[st.st_size]);
++      contents_.reset(new uint8_t[st.st_size]);
++      off_t total = 0;
+       while (total < st.st_size && !feof(f)) {
+-        size_t read = fread(&contents[0] + total, 1, st.st_size - total, f);
++        size_t read = fread(&contents_[0] + total, 1, st.st_size - total, f);
+         if (read == 0) {
+           if (ferror(f)) {
+             read_ok = false;
+@@ -182,22 +180,16 @@ bool DumpSymbols::Read(const string& filename) {
+ 
+   if (!read_ok) {
+     fprintf(stderr, "Error reading object file: %s: %s\n",
+-            object_filename.c_str(), error.c_str());
++            object_filename_.c_str(),
++            error.c_str());
+     return false;
+   }
+-  return ReadData(contents.release(), total, object_filename);
+-}
+-
+-bool DumpSymbols::ReadData(uint8_t* contents, size_t size,
+-                           const std::string& filename) {
+-  contents_.reset(contents);
+-  size_ = size;
+-  object_filename_ = filename;
+ 
+   // Get the list of object files present in the file.
+   FatReader::Reporter fat_reporter(object_filename_);
+   FatReader fat_reader(&fat_reporter);
+-  if (!fat_reader.Read(contents_.get(), size)) {
++  if (!fat_reader.Read(&contents_[0],
++                       st.st_size)) {
+     return false;
+   }
+ 
+@@ -291,13 +283,7 @@ SuperFatArch* DumpSymbols::FindBestMatchForArchitecture(
+ }
+ 
+ string DumpSymbols::Identifier() {
+-  scoped_ptr<FileID> file_id;
+-
+-  if (from_disk_) {
+-    file_id.reset(new FileID(object_filename_.c_str()));
+-  } else {
+-    file_id.reset(new FileID(contents_.get(), size_));
+-  }
++  FileID file_id(object_filename_.c_str());
+   unsigned char identifier_bytes[16];
+   scoped_ptr<Module> module;
+   if (!selected_object_file_) {
+@@ -306,7 +292,7 @@ string DumpSymbols::Identifier() {
+   }
+   cpu_type_t cpu_type = selected_object_file_->cputype;
+   cpu_subtype_t cpu_subtype = selected_object_file_->cpusubtype;
+-  if (!file_id->MachoIdentifier(cpu_type, cpu_subtype, identifier_bytes)) {
++  if (!file_id.MachoIdentifier(cpu_type, cpu_subtype, identifier_bytes)) {
+     fprintf(stderr, "Unable to calculate UUID of mach-o binary %s!\n",
+             object_filename_.c_str());
+     return "";
+diff --git a/src/common/mac/dump_syms.h b/src/common/mac/dump_syms.h
+index 34ba14bc0e48f4b4b62d160bdff41a48a0613fb6..4365e2944cf63c6f96f936a883694bd24c4604fd 100644
+--- a/src/common/mac/dump_syms.h
++++ b/src/common/mac/dump_syms.h
+@@ -57,30 +57,21 @@ class DumpSymbols {
+   DumpSymbols(SymbolData symbol_data, bool handle_inter_cu_refs)
+       : symbol_data_(symbol_data),
+         handle_inter_cu_refs_(handle_inter_cu_refs),
++        input_pathname_(),
+         object_filename_(),
+         contents_(),
+-        size_(0),
+-        from_disk_(false),
+         object_files_(),
+         selected_object_file_(),
+-        selected_object_name_() {}
++        selected_object_name_() { }
+   ~DumpSymbols() {
+   }
+ 
+   // Prepare to read debugging information from |filename|. |filename| may be
+-  // the name of a fat file, a Mach-O file, or a dSYM bundle containing either
+-  // of the above. On success, return true; if there is a problem reading
+-  // |filename|, report it and return false.
++  // the name of a universal binary, a Mach-O file, or a dSYM bundle
++  // containing either of the above. On success, return true; if there is a
++  // problem reading |filename|, report it and return false.
+   bool Read(const std::string& filename);
+ 
+-  // Prepare to read debugging information from |contents|. |contents| is
+-  // expected to be the data obtained from reading a fat file, or a Mach-O file.
+-  // |filename| is used to determine the object filename in the generated
+-  // output; there will not be an attempt to open this file as the data
+-  // is already expected to be in memory. On success, return true; if there is a
+-  // problem reading |contents|, report it and return false.
+-  bool ReadData(uint8_t* contents, size_t size, const std::string& filename);
+-
+   // If this dumper's file includes an object file for |cpu_type| and
+   // |cpu_subtype|, then select that object file for dumping, and return
+   // true. Otherwise, return false, and leave this dumper's selected
+@@ -171,22 +162,19 @@ class DumpSymbols {
+   // Whether to handle references between compilation units.
+   const bool handle_inter_cu_refs_;
+ 
++  // The name of the file or bundle whose symbols this will dump.
++  // This is the path given to Read, for use in error messages.
++  std::string input_pathname_;
++
+   // The name of the file this DumpSymbols will actually read debugging
+-  // information from. If the filename passed to Read refers to a dSYM bundle,
+-  // then this is the resource file within that bundle.
++  // information from. Normally, this is the same as input_pathname_, but if
++  // filename refers to a dSYM bundle, then this is the resource file
++  // within that bundle.
+   std::string object_filename_;
+ 
+   // The complete contents of object_filename_, mapped into memory.
+   scoped_array<uint8_t> contents_;
+ 
+-  // The size of contents_.
+-  size_t size_;
+-
+-  // Indicates which entry point to DumpSymbols was used, i.e. Read vs ReadData.
+-  // This is used to indicate that downstream code paths can/should also read
+-  // from disk or not.
+-  bool from_disk_;
+-
+   // A vector of SuperFatArch structures describing the object files
+   // object_filename_ contains. If object_filename_ refers to a fat binary,
+   // this may have more than one element; if it refers to a Mach-O file, this
+diff --git a/src/common/mac/file_id.cc b/src/common/mac/file_id.cc
+index 9ed65e5c8507496fbe1729fabf37cd9b83f509a2..4007ef0eb04e733fd4bf83b42961472db94a8ef3 100644
+--- a/src/common/mac/file_id.cc
++++ b/src/common/mac/file_id.cc
+@@ -33,41 +33,54 @@
+ //
+ // Author: Dan Waylonis
+ 
+-#include "common/mac/file_id.h"
+-
+ #include <fcntl.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <unistd.h>
+ 
++#include "common/mac/file_id.h"
+ #include "common/mac/macho_id.h"
+-#include "common/scoped_ptr.h"
+ 
+ using MacFileUtilities::MachoID;
+ 
+ namespace google_breakpad {
+ namespace mach_o {
+-// Constructs a FileID given a path to a file
+-FileID::FileID(const char* path) : memory_(nullptr), size_(0) {
++
++FileID::FileID(const char *path) {
+   snprintf(path_, sizeof(path_), "%s", path);
+ }
+ 
+-// Constructs a FileID given the contents of a file and its size
+-FileID::FileID(void* memory, size_t size)
+-    : path_(), memory_(memory), size_(size) {}
++bool FileID::FileIdentifier(unsigned char identifier[16]) {
++  int fd = open(path_, O_RDONLY);
++  if (fd == -1)
++    return false;
++
++  MD5Context md5;
++  MD5Init(&md5);
++
++  // Read 4k x 2 bytes at a time.  This is faster than just 4k bytes, but
++  // doesn't seem to be an unreasonable size for the stack.
++  unsigned char buffer[4096 * 2];
++  size_t buffer_size = sizeof(buffer);
++  while ((buffer_size = read(fd, buffer, buffer_size) > 0)) {
++    MD5Update(&md5, buffer, static_cast<unsigned>(buffer_size));
++  }
++
++  close(fd);
++  MD5Final(identifier, &md5);
++
++  return true;
++}
+ 
+ bool FileID::MachoIdentifier(cpu_type_t cpu_type,
+                              cpu_subtype_t cpu_subtype,
+                              unsigned char identifier[16]) {
+-  scoped_ptr<MachoID> macho;
+-  if (memory_) {
+-    macho.reset(new MachoID(memory_, size_));
+-  } else {
+-    macho.reset(new MachoID(path_));
+-  }
+-  if (macho->UUIDCommand(cpu_type, cpu_subtype, identifier))
++  MachoID macho(path_);
++
++  if (macho.UUIDCommand(cpu_type, cpu_subtype, identifier))
+     return true;
+ 
+-  return macho->MD5(cpu_type, cpu_subtype, identifier);
++  return macho.MD5(cpu_type, cpu_subtype, identifier);
+ }
+ 
+ // static
+diff --git a/src/common/mac/file_id.h b/src/common/mac/file_id.h
+index fc1821e7f74d7a8a61181c77f59a804fa54df4d1..2faa65bb12a6c8058457ae11d3e7495bd69d87c6 100644
+--- a/src/common/mac/file_id.h
++++ b/src/common/mac/file_id.h
+@@ -36,20 +36,21 @@
+ 
+ #include <limits.h>
+ #include <mach/machine.h>
+-#include <stddef.h>
+ 
+ namespace google_breakpad {
+ namespace mach_o {
+ 
+ class FileID {
+  public:
+-  // Constructs a FileID given a path to a file
+-  FileID(const char* path);
+-
+-  // Constructs a FileID given the contents of a file and its size.
+-  FileID(void* memory, size_t size);
++  FileID(const char *path);
+   ~FileID() {}
+ 
++  // Load the identifier for the file path specified in the constructor into
++  // |identifier|.  Return false if the identifier could not be created for the
++  // file.
++  // The current implementation will return the MD5 hash of the file's bytes.
++  bool FileIdentifier(unsigned char identifier[16]);
++
+   // Treat the file as a mach-o file that will contain one or more archicture.
+   // Accepted values for |cpu_type| and |cpu_subtype| (e.g., CPU_TYPE_X86 or
+   // CPU_TYPE_POWERPC) are listed in /usr/include/mach/machine.h.
+@@ -74,16 +75,6 @@ class FileID {
+  private:
+   // Storage for the path specified
+   char path_[PATH_MAX];
+-
+-  // Storage for contents of a file if this instance is used to operate on in
+-  // memory file data rather than directly from a filesystem. If memory_ is
+-  // null, the file represented by path_ will be opened/read. If memory_ is
+-  // non-null, it is assumed to contain valid data, and no file operations will
+-  // occur.
+-  void* memory_;
+-
+-  // Size of memory_
+-  size_t size_;
+ };
+ 
+ }  // namespace mach_o
+diff --git a/src/common/mac/macho_id.cc b/src/common/mac/macho_id.cc
+index 9b7ca24f3478f0f45c45fd3c6c1521c6742f408f..03f92773a3fb98c9a3a065d2d40e33fd0139b8d7 100644
+--- a/src/common/mac/macho_id.cc
++++ b/src/common/mac/macho_id.cc
+@@ -37,7 +37,11 @@
+ #include <fcntl.h>
+ #include <mach-o/loader.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <unistd.h>
+ 
+ #include "common/mac/macho_id.h"
+ #include "common/mac/macho_walker.h"
+@@ -50,18 +54,73 @@ using google_breakpad::MD5Update;
+ using google_breakpad::MD5Final;
+ 
+ MachoID::MachoID(const char* path)
+-    : memory_(0), memory_size_(0), md5_context_(), update_function_(NULL) {
++   : memory_(0),
++     memory_size_(0),
++     crc_(0),
++     md5_context_(),
++     update_function_(NULL) {
+   snprintf(path_, sizeof(path_), "%s", path);
+ }
+ 
+-MachoID::MachoID(void* memory, size_t size)
+-    : path_(),
+-      memory_(memory),
+-      memory_size_(size),
+-      md5_context_(),
+-      update_function_(NULL) {}
++MachoID::MachoID(const char* path, void* memory, size_t size)
++   : memory_(memory),
++     memory_size_(size),
++     crc_(0),
++     md5_context_(),
++     update_function_(NULL) {
++  snprintf(path_, sizeof(path_), "%s", path);
++}
++
++MachoID::~MachoID() {
++}
+ 
+-MachoID::~MachoID() {}
++// The CRC info is from http://en.wikipedia.org/wiki/Adler-32
++// With optimizations from http://www.zlib.net/
++
++// The largest prime smaller than 65536
++#define MOD_ADLER 65521
++// MAX_BLOCK is the largest n such that 255n(n+1)/2 + (n+1)(MAX_BLOCK-1) <= 2^32-1
++#define MAX_BLOCK 5552
++
++void MachoID::UpdateCRC(unsigned char* bytes, size_t size) {
++// Unrolled loops for summing
++#define DO1(buf,i)  {sum1 += (buf)[i]; sum2 += sum1;}
++#define DO2(buf,i)  DO1(buf,i); DO1(buf,i+1);
++#define DO4(buf,i)  DO2(buf,i); DO2(buf,i+2);
++#define DO8(buf,i)  DO4(buf,i); DO4(buf,i+4);
++#define DO16(buf)   DO8(buf,0); DO8(buf,8);
++  // Split up the crc
++  uint32_t sum1 = crc_ & 0xFFFF;
++  uint32_t sum2 = (crc_ >> 16) & 0xFFFF;
++
++  // Do large blocks
++  while (size >= MAX_BLOCK) {
++    size -= MAX_BLOCK;
++    int block_count = MAX_BLOCK / 16;
++    do {
++      DO16(bytes);
++      bytes += 16;
++    } while (--block_count);
++    sum1 %= MOD_ADLER;
++    sum2 %= MOD_ADLER;
++  }
++
++  // Do remaining bytes
++  if (size) {
++    while (size >= 16) {
++      size -= 16;
++      DO16(bytes);
++      bytes += 16;
++    }
++    while (size--) {
++      sum1 += *bytes++;
++      sum2 += sum1;
++    }
++    sum1 %= MOD_ADLER;
++    sum2 %= MOD_ADLER;
++    crc_ = (sum2 << 16) | sum1;
++  }
++}
+ 
+ void MachoID::UpdateMD5(unsigned char* bytes, size_t size) {
+   MD5Update(&md5_context_, bytes, static_cast<unsigned>(size));
+@@ -110,6 +169,59 @@ bool MachoID::UUIDCommand(cpu_type_t cpu_type,
+   return false;
+ }
+ 
++bool MachoID::IDCommand(cpu_type_t cpu_type,
++                        cpu_subtype_t cpu_subtype,
++                        unsigned char identifier[16]) {
++  struct dylib_command dylib_cmd;
++  dylib_cmd.cmd = 0;
++  if (!WalkHeader(cpu_type, cpu_subtype, IDWalkerCB, &dylib_cmd))
++    return false;
++
++  // If we found the command, we'll have initialized the dylib_command
++  // structure
++  if (dylib_cmd.cmd == LC_ID_DYLIB) {
++    // Take the hashed filename, version, and compatability version bytes
++    // to form the first 12 bytes, pad the rest with zeros
++
++    // create a crude hash of the filename to generate the first 4 bytes
++    identifier[0] = 0;
++    identifier[1] = 0;
++    identifier[2] = 0;
++    identifier[3] = 0;
++
++    for (int j = 0, i = (int)strlen(path_)-1; i>=0 && path_[i]!='/'; ++j, --i) {
++      identifier[j%4] += path_[i];
++    }
++
++    identifier[4] = (dylib_cmd.dylib.current_version >> 24) & 0xFF;
++    identifier[5] = (dylib_cmd.dylib.current_version >> 16) & 0xFF;
++    identifier[6] = (dylib_cmd.dylib.current_version >> 8) & 0xFF;
++    identifier[7] = dylib_cmd.dylib.current_version & 0xFF;
++    identifier[8] = (dylib_cmd.dylib.compatibility_version >> 24) & 0xFF;
++    identifier[9] = (dylib_cmd.dylib.compatibility_version >> 16) & 0xFF;
++    identifier[10] = (dylib_cmd.dylib.compatibility_version >> 8) & 0xFF;
++    identifier[11] = dylib_cmd.dylib.compatibility_version & 0xFF;
++    identifier[12] = (cpu_type >> 24) & 0xFF;
++    identifier[13] = (cpu_type >> 16) & 0xFF;
++    identifier[14] = (cpu_type >> 8) & 0xFF;
++    identifier[15] = cpu_type & 0xFF;
++
++    return true;
++  }
++
++  return false;
++}
++
++uint32_t MachoID::Adler32(cpu_type_t cpu_type, cpu_subtype_t cpu_subtype) {
++  update_function_ = &MachoID::UpdateCRC;
++  crc_ = 0;
++
++  if (!WalkHeader(cpu_type, cpu_subtype, WalkerCB, this))
++    return 0;
++
++  return crc_;
++}
++
+ bool MachoID::MD5(cpu_type_t cpu_type, cpu_subtype_t cpu_subtype, unsigned char identifier[16]) {
+   update_function_ = &MachoID::UpdateMD5;
+ 
+@@ -234,4 +346,24 @@ bool MachoID::UUIDWalkerCB(MachoWalker* walker, load_command* cmd, off_t offset,
+   // Continue processing
+   return true;
+ }
++
++// static
++bool MachoID::IDWalkerCB(MachoWalker* walker, load_command* cmd, off_t offset,
++                         bool swap, void* context) {
++  if (cmd->cmd == LC_ID_DYLIB) {
++    struct dylib_command* dylib_cmd = (struct dylib_command*)context;
++
++    if (!walker->ReadBytes(dylib_cmd, sizeof(struct dylib_command), offset))
++      return false;
++
++    if (swap)
++      breakpad_swap_dylib_command(dylib_cmd);
++
++    return false;
++  }
++
++  // Continue processing
++  return true;
++}
++
+ }  // namespace MacFileUtilities
+diff --git a/src/common/mac/macho_id.h b/src/common/mac/macho_id.h
+index 0262697d41d4d5d0c5a34bfb51e39b2f6bd46c69..e8874c37cdf9714adb3e2d855bbcad8d241a9000 100644
+--- a/src/common/mac/macho_id.h
++++ b/src/common/mac/macho_id.h
+@@ -46,7 +46,7 @@ namespace MacFileUtilities {
+ class MachoID {
+  public:
+   MachoID(const char* path);
+-  MachoID(void* memory, size_t size);
++  MachoID(const char* path, void* memory, size_t size);
+   ~MachoID();
+ 
+   // For the given |cpu_type| and |cpu_subtype|, return a UUID from the LC_UUID
+@@ -56,6 +56,19 @@ class MachoID {
+                    cpu_subtype_t cpu_subtype,
+                    unsigned char identifier[16]);
+ 
++  // For the given |cpu_type| and |cpu_subtype|, return a UUID from the
++  // LC_ID_DYLIB command.
++  // Return false if there isn't a LC_ID_DYLIB command.
++  bool IDCommand(cpu_type_t cpu_type,
++                 cpu_subtype_t cpu_subtype,
++                 unsigned char identifier[16]);
++
++  // For the given |cpu_type| and |cpu_subtype|, return the Adler32 CRC for the
++  // mach-o data segment(s).
++  // Return 0 on error (e.g., if the file is not a mach-o file)
++  uint32_t Adler32(cpu_type_t cpu_type,
++                   cpu_subtype_t cpu_subtype);
++
+   // For the given |cpu_type|, and |cpu_subtype| return the MD5 for the mach-o
+   // data segment(s).
+   // Return true on success, false otherwise
+@@ -67,6 +80,10 @@ class MachoID {
+   // Signature of class member function to be called with data read from file
+   typedef void (MachoID::*UpdateFunction)(unsigned char* bytes, size_t size);
+ 
++  // Update the CRC value by examining |size| |bytes| and applying the algorithm
++  // to each byte.
++  void UpdateCRC(unsigned char* bytes, size_t size);
++
+   // Update the MD5 value by examining |size| |bytes| and applying the algorithm
+   // to each byte.
+   void UpdateMD5(unsigned char* bytes, size_t size);
+@@ -86,6 +103,10 @@ class MachoID {
+   static bool UUIDWalkerCB(MachoWalker* walker, load_command* cmd, off_t offset,
+                            bool swap, void* context);
+ 
++  // The callback from the MachoWalker for LC_ID_DYLIB
++  static bool IDWalkerCB(MachoWalker* walker, load_command* cmd, off_t offset,
++                         bool swap, void* context);
++
+   // File path
+   char path_[PATH_MAX];
+ 
+@@ -95,6 +116,9 @@ class MachoID {
+   // Size of the memory region
+   size_t memory_size_;
+ 
++  // The current crc value
++  uint32_t crc_;
++
+   // The MD5 context
+   google_breakpad::MD5Context md5_context_;
+ 
