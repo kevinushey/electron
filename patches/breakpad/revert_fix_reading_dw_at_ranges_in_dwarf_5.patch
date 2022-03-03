@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VerteDinde <vertedinde@electronjs.org>
+Date: Wed, 2 Mar 2022 16:50:03 -0800
+Subject: Revert "Fix reading DW_AT_ranges in dwarf 5"
+
+This reverts commit 92a20b650400d110bf14378195e1346c7b0635de.
+
+diff --git a/src/common/dwarf/dwarf2reader.cc b/src/common/dwarf/dwarf2reader.cc
+index bf6758d8ad9aea0a0b1dc43649306d7a51060727..aa4ec2b67b61b68679a836b4cf09ced30aa37e49 100644
+--- a/src/common/dwarf/dwarf2reader.cc
++++ b/src/common/dwarf/dwarf2reader.cc
+@@ -1793,7 +1793,7 @@ bool RangeListReader::ReadRanges(enum DwarfForm form, uint64_t data) {
+     }
+   } else if (form == DW_FORM_rnglistx) {
+     offset_array_ = cu_info_->ranges_base_;
+-    uint64_t index_offset = reader_->OffsetSize() * data;
++    uint64_t index_offset = reader_->AddressSize() * data;
+     uint64_t range_list_offset =
+         reader_->ReadOffset(cu_info_->buffer_ + offset_array_ + index_offset);
+ 

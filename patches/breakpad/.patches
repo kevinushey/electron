@@ -1,1 +1,2 @@
 revert_allow_dump_syms_to_operate_on_contents_in_memory.patch
+revert_fix_reading_dw_at_ranges_in_dwarf_5.patch
