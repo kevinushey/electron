@@ -35,7 +35,7 @@ enable_pseudolocales = false
 
 is_cfi = false
 
-enable_dsyms = false
+# enable_dsyms = false
 
 # Make application name configurable at runtime for cookie crypto
 allow_runtime_configurable_key_storage = true
